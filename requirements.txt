@@ -1,0 +1,6 @@
+pyTelegramBotAPI
+requests
+pypdf
+sentence-transformers
+numpy
+langgraph

@@ -1,0 +1,32 @@
+# PDF 파일 제외 (용량 크고 민감할 수 있음)
+*.pdf
+Papers/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+
+# 가상환경
+.venv/
+venv/
+env/
+
+# 환경변수
+.env
+.env.*
+
+# sentence-transformers 캐시
+.cache/
+
+# Jupyter 체크포인트
+.ipynb_checkpoints/
+
+# IDE
+.idea/
+.vscode/
+*.swp
