@@ -4,3 +4,7 @@ pypdf
 sentence-transformers
 numpy
 langgraph
+langchain-core
+langchain-community
+langchain-openai
+langchain-text-splitters
