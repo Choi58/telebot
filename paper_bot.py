@@ -14,7 +14,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from pypdf import PdfReader
 
 from orchestrator import OrchestratorConfig, PaperLLMOrchestrator
-from tools import tool_get_section, tool_parse_pdf
+from tools import tool_list_pdfs, tool_open_pdf
 
 
 TraceCallback = Callable[[str, dict[str, Any]], None]
@@ -110,6 +110,8 @@ class PaperBotService:
                 f"[QUERY] normalized={event.get('normalized_ko', '')} | "
                 f"en={event.get('english', '')}"
             )
+        if name == "query_translated":
+            return f"[QUERY] translated={event.get('translated', '')}"
         if name == "intent_corrected":
             return (
                 f"[PLAN] intent corrected: {event.get('from_intent')} -> {event.get('to_intent')} "
@@ -119,10 +121,13 @@ class PaperBotService:
             return f"[TOOL] {event.get('name')} 호출 (max_pages={event.get('max_pages')})"
         if name == "tool_result":
             return f"[TOOL] {event.get('name')} 완료 (pages_used={event.get('pages_used')})"
+        if name == "active_pdf_selected":
+            return f"[CTX] session active_pdf 사용: {event.get('pdf_path', '')}"
         if name == "iteration_start":
             return (
                 f"[LOOP] iter={event.get('iteration')} 시작 "
-                f"(top_k={event.get('top_k')}, has_parsed={event.get('has_parsed')})"
+                f"(top_k={event.get('top_k')}, has_parsed={event.get('has_parsed')}, "
+                f"chunks={event.get('available_chunks', 0)})"
             )
         if name == "step_planned":
             return (
@@ -136,8 +141,12 @@ class PaperBotService:
             )
         if name == "context_selected":
             names = event.get("section_names", []) or []
+            chunk_ids = event.get("chunk_ids", []) or []
             preview = ", ".join(str(n) for n in names[:3]) if names else "(없음)"
-            return f"[CTX] iter={event.get('iteration')} 선택 섹션: {preview}"
+            return (
+                f"[CTX] iter={event.get('iteration')} 선택 섹션: {preview} "
+                f"(chunks={len(chunk_ids)})"
+            )
         if name == "iteration_check":
             return (
                 f"[CHECK] iter={event.get('iteration')} "
@@ -171,11 +180,14 @@ class PaperBotService:
             self.sessions[sid] = {
                 "summary": "",
                 "recent_turns": [],
-                "state": {},
+                "state": {"active_pdf": ""},
                 "last_reset_date": None,
                 "trace_enabled": self.trace_default_on,
                 "log_file_name": self._new_log_file_name(sid),
             }
+        else:
+            state = self.sessions[sid].setdefault("state", {})
+            state.setdefault("active_pdf", "")
         return self.sessions[sid]
 
     def _new_log_file_name(self, safe_session_id: str) -> str:
@@ -183,10 +195,13 @@ class PaperBotService:
         return f"{safe_session_id}_{stamp}.md"
 
     def _list_pdf_paths(self) -> list[Path]:
-        pdf_root = Path(self.orchestrator.config.pdf_dir)
-        if not pdf_root.exists():
+        listed = tool_list_pdfs(self.orchestrator.config.pdf_dir)
+        if not listed.get("ok"):
             return []
-        return sorted(pdf_root.glob("*.pdf"))
+        data = listed.get("data", {}) or {}
+        files = [str(x) for x in (data.get("files", []) or [])]
+        root = Path(self.orchestrator.config.pdf_dir)
+        return [root / f for f in files]
 
     def _cache_key_for_pdf(self, pdf_path: Path) -> str:
         stat = pdf_path.stat()
@@ -225,7 +240,7 @@ class PaperBotService:
         if cached is not None:
             return cached, True
 
-        parsed_raw = tool_parse_pdf(str(pdf_path), max_pages=self.orchestrator.config.max_pages_default)
+        parsed_raw = tool_open_pdf(str(pdf_path), max_pages=self.orchestrator.config.max_pages_default)
         if not parsed_raw.get("ok"):
             raise RuntimeError(str(parsed_raw.get("error", "unknown parse error")))
         parsed = parsed_raw.get("data", {}) or {}
@@ -542,13 +557,16 @@ class PaperBotService:
         if not section_ids:
             return None, []
 
+        flat = self._flatten_sections(parsed.get("sections", []))
+        by_id: dict[str, dict[str, Any]] = {}
+        for sec in flat:
+            sid = str(sec.get("id", "")).strip()
+            if sid:
+                by_id[sid] = sec
+
         blocks: list[str] = []
         for sid in section_ids:
-            got = tool_get_section(str(pdf_path), sid, max_pages=self.orchestrator.config.max_pages_default)
-            if not got.get("ok"):
-                continue
-            data = got.get("data", {}) or {}
-            sec = data.get("section", {}) or {}
+            sec = by_id.get(sid, {})
             sec_name = str(sec.get("name", sid)).strip()
             sec_text = "\n".join(sec.get("paragraphs", []))[:3000]
             if sec_text.strip():
@@ -581,7 +599,7 @@ class PaperBotService:
         today = datetime.now(self.session_tz).date().isoformat()
         session["summary"] = ""
         session["recent_turns"] = []
-        session["state"] = {}
+        session["state"] = {"active_pdf": ""}
         session["last_reset_date"] = today
         session["log_file_name"] = self._new_log_file_name(sid)
 
@@ -593,12 +611,100 @@ class PaperBotService:
         if now >= reset_point and session.get("last_reset_date") != today:
             session["summary"] = ""
             session["recent_turns"] = []
-            session["state"] = {}
+            session["state"] = {"active_pdf": ""}
             session["last_reset_date"] = today
             sid = str(session.get("session_id_safe", "default"))
             session["log_file_name"] = self._new_log_file_name(sid)
             return True
         return False
+
+    def _resolve_effective_pdf_path(
+        self,
+        *,
+        session: dict[str, Any],
+        user_query: str,
+        explicit_pdf_path: str | None,
+    ) -> str | None:
+        # 1) Explicit API argument always wins.
+        if explicit_pdf_path:
+            return explicit_pdf_path
+
+        # 2) If current message mentions a pdf filename, use it.
+        mentioned = self._extract_pdf_path_from_query(user_query)
+        if mentioned:
+            return mentioned
+
+        # 3) Deictic reference handling: "이거/그거/저거/위에서/아까/that/it..." -> pull previous paper context.
+        deictic = self._has_deictic_reference(user_query)
+
+        # 3-a) Fallback to session active pdf for context continuity.
+        state = session.get("state", {}) if isinstance(session.get("state", {}), dict) else {}
+        active_pdf = str(state.get("active_pdf", "")).strip()
+        if active_pdf and Path(active_pdf).exists():
+            return active_pdf
+
+        # 3-b) If active_pdf is missing but user used deictic wording, recover from recent turns.
+        if deictic:
+            recovered = self._recover_pdf_path_from_session_history(session)
+            if recovered:
+                return recovered
+        return None
+
+    @staticmethod
+    def _has_deictic_reference(query: str) -> bool:
+        q = (query or "").strip().lower()
+        if not q:
+            return False
+        markers = [
+            "이거",
+            "그거",
+            "저거",
+            "이 논문",
+            "그 논문",
+            "저 논문",
+            "아까",
+            "방금",
+            "위에서",
+            "앞에서",
+            "해당 논문",
+            "that",
+            "it",
+            "this paper",
+            "that paper",
+            "previous paper",
+        ]
+        return any(m in q for m in markers)
+
+    def _recover_pdf_path_from_session_history(self, session: dict[str, Any]) -> str | None:
+        # 1) recent_turns에서 마지막으로 언급된 *.pdf를 역순 탐색
+        recent_turns: list[dict[str, str]] = session.get("recent_turns", []) or []
+        for turn in reversed(recent_turns):
+            content = str(turn.get("content", "")).strip()
+            if not content:
+                continue
+            found = self._extract_pdf_path_from_query(content)
+            if found and Path(found).exists():
+                return found
+
+        # 2) session summary에서도 한 번 더 탐색
+        summary = str(session.get("summary", "")).strip()
+        if summary:
+            found = self._extract_pdf_path_from_query(summary)
+            if found and Path(found).exists():
+                return found
+        return None
+
+    def _update_active_pdf_from_result(self, session: dict[str, Any], result: dict[str, Any]) -> None:
+        state = session.setdefault("state", {})
+        if not isinstance(state, dict):
+            session["state"] = {}
+            state = session["state"]
+        route = str(result.get("route", "")).strip().lower()
+        chosen = str(result.get("pdf_path", "")).strip()
+        # Keep continuity only for paper routes.
+        paper_routes = {"qa", "summary", "method", "result", "limitation", "background"}
+        if route in paper_routes and chosen and Path(chosen).exists():
+            state["active_pdf"] = chosen
 
     def _build_contextual_query(self, user_text: str, session: dict[str, Any]) -> str:
         summary = str(session.get("summary", "")).strip()
@@ -730,12 +836,30 @@ class PaperBotService:
         if english_query:
             contextual_query = f"{contextual_query}\n\n[English Query]\n{english_query}"
 
+        effective_pdf_path = self._resolve_effective_pdf_path(
+            session=session,
+            user_query=query,
+            explicit_pdf_path=pdf_path,
+        )
+        if effective_pdf_path and trace_enabled:
+            _emit_local(
+                {
+                    "event": "active_pdf_selected",
+                    "pdf_path": effective_pdf_path,
+                }
+            )
+
+        retrieval_query = normalized_ko
+        if english_query:
+            retrieval_query = f"{normalized_ko}\n{english_query}"
+
         result = self.orchestrator.answer(
             query=contextual_query,
-            pdf_path=pdf_path,
-            intent_query=normalized_ko,
+            pdf_path=effective_pdf_path,
+            intent_query=retrieval_query,
             on_event=_emit_local,
         )
+        self._update_active_pdf_from_result(session, result)
         answer = result.get("answer", "")
         route = result.get("route", "qa")
         context_meta = result.get("context_meta", {})
@@ -743,7 +867,7 @@ class PaperBotService:
         if route in {"qa", "summary", "method", "result", "limitation", "background"} and self._is_low_confidence_answer(
             answer
         ):
-            target_pdf = str(result.get("pdf_path", "")).strip() or (pdf_path or "")
+            target_pdf = str(result.get("pdf_path", "")).strip() or (effective_pdf_path or "")
             if not target_pdf:
                 extracted = self._extract_pdf_path_from_query(query)
                 target_pdf = extracted or ""

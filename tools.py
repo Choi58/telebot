@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from pdf_viewer_core import PDFPaperParser, ParsedPaper, SectionNode
+from pdf_viewer_core import PDFPaperParser, ParsedPaper
 
 
 def _ok(data: Any) -> dict[str, Any]:
@@ -14,22 +14,8 @@ def _error(message: str) -> dict[str, Any]:
     return {"ok": False, "error": message}
 
 
-def _find_section_node(nodes: list[SectionNode], section_id: str) -> SectionNode | None:
-    for node in nodes:
-        if node.id == section_id:
-            return node
-        found = _find_section_node(node.children, section_id)
-        if found is not None:
-            return found
-    return None
-
-
-def tool_parse_pdf(path: str, max_pages: int | None = None) -> dict[str, Any]:
-    """Parse one PDF and return structured data.
-
-    Returns:
-        {"ok": True, "data": {...}} or {"ok": False, "error": "..."}
-    """
+def _open_pdf_impl(path: str, max_pages: int | None = None) -> dict[str, Any]:
+    """Internal PDF open/parse implementation."""
     try:
         p = Path(path)
         if not p.exists():
@@ -39,49 +25,25 @@ def tool_parse_pdf(path: str, max_pages: int | None = None) -> dict[str, Any]:
         paper: ParsedPaper = parser.parse_pdf(p, max_pages=max_pages)
         return _ok(paper.to_dict())
     except Exception as e:
-        return _error(f"tool_parse_pdf failed: {type(e).__name__}: {e}")
+        return _error(f"tool_open_pdf failed: {type(e).__name__}: {e}")
 
 
-def tool_parse_directory(directory: str, max_pages: int | None = None) -> dict[str, Any]:
-    """Parse every PDF in a directory.
+def tool_open_pdf(path: str, max_pages: int | None = None) -> dict[str, Any]:
+    """Open one PDF and return structured data."""
+    return _open_pdf_impl(path, max_pages=max_pages)
+
+
+def tool_list_pdfs(directory: str) -> dict[str, Any]:
+    """List PDF files in a directory.
 
     Returns:
-        {"ok": True, "data": [ ...parsed papers... ]} or error object.
+        {"ok": True, "data": {"directory":"...", "files":[...]}} or error object.
     """
     try:
         d = Path(directory)
         if not d.exists() or not d.is_dir():
             return _error(f"Directory not found: {directory}")
-
-        parser = PDFPaperParser(max_pages=max_pages)
-        papers = parser.parse_directory(d)
-        return _ok([p.to_dict() for p in papers])
+        files = sorted([p.name for p in d.glob("*.pdf") if p.is_file()])
+        return _ok({"directory": str(d), "files": files})
     except Exception as e:
-        return _error(f"tool_parse_directory failed: {type(e).__name__}: {e}")
-
-
-def tool_get_section(path: str, section_id: str, max_pages: int | None = None) -> dict[str, Any]:
-    """Parse one PDF and return only one section node by section id.
-
-    Example section_id: "2", "2.1", "2.1.2"
-    """
-    try:
-        p = Path(path)
-        if not p.exists():
-            return _error(f"File not found: {path}")
-
-        parser = PDFPaperParser(max_pages=max_pages)
-        paper = parser.parse_pdf(p, max_pages=max_pages)
-        node = _find_section_node(paper.sections, section_id)
-        if node is None:
-            return _error(f"Section not found: {section_id}")
-
-        return _ok(
-            {
-                "file_path": paper.file_path,
-                "section_id": section_id,
-                "section": node.to_dict(),
-            }
-        )
-    except Exception as e:
-        return _error(f"tool_get_section failed: {type(e).__name__}: {e}")
+        return _error(f"tool_list_pdfs failed: {type(e).__name__}: {e}")
