@@ -34,3 +34,7 @@ env/
 
 # legacy
 legacy_experiments/
+
+# session logs
+session/
+sessions/
