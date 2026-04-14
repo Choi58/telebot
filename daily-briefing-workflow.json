@@ -1,0 +1,94 @@
+{
+  "name": "Daily Briefing (telebot API)",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "triggerAtHour": 7,
+              "triggerAtMinute": 30
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.3,
+      "position": [
+        40,
+        40
+      ],
+      "id": "c4a2e0e4-8f0c-4d57-a6c8-3a0f6f12f001",
+      "name": "Schedule Trigger"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://host.docker.internal:8000/daily-briefing",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\"chat_id\": 8623134647, \"session_id\": \"8623134647\"}"
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        280,
+        40
+      ],
+      "id": "c4a2e0e4-8f0c-4d57-a6c8-3a0f6f12f002",
+      "name": "Call Daily Briefing API"
+    },
+    {
+      "parameters": {
+        "chatId": "8623134647",
+        "text": "={{ $json.ok ? `Daily briefing 실행 완료\\n- papers: ${$json.papers}\\n- cache_hits: ${$json.cache_hits}\\n- pages_used: ${$json.pages_used}` : `Daily briefing 실행 실패\\n- 응답: ${JSON.stringify($json)}` }}",
+        "additionalFields": {}
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        520,
+        40
+      ],
+      "id": "c4a2e0e4-8f0c-4d57-a6c8-3a0f6f12f003",
+      "name": "Notify Status",
+      "credentials": {
+        "telegramApi": {
+          "id": "z79ojtOIHdtLhPsN",
+          "name": "Telegram account"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "Call Daily Briefing API",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Call Daily Briefing API": {
+      "main": [
+        [
+          {
+            "node": "Notify Status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "tags": []
+}

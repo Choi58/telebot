@@ -112,6 +112,23 @@ def _cmd_daily_briefing(args: argparse.Namespace) -> int:
     return 0
 
 
+def _resolve_session_id(session_id: str, chat_id: int | None) -> str:
+    sid = (session_id or "").strip()
+    if sid:
+        return sid
+    if chat_id is not None:
+        return str(chat_id)
+    raise ValueError("Either --session-id or --chat-id is required.")
+
+
+def _cmd_reset(args: argparse.Namespace) -> int:
+    service = PaperBotService()
+    session_id = _resolve_session_id(args.session_id, args.chat_id)
+    service.reset_session(session_id=session_id)
+    _print_result({"ok": True, "mode": "reset", "session_id": session_id})
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="n8n-oriented Telegram notifier entrypoint")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -134,6 +151,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_daily.add_argument("--chat-id", type=int, required=True)
     p_daily.add_argument("--session-id", default="")
     p_daily.set_defaults(func=_cmd_daily_briefing)
+
+    p_reset = sub.add_parser("reset", help="reset session memory and persist cleared state")
+    p_reset.add_argument("--session-id", default="")
+    p_reset.add_argument("--chat-id", type=int, default=None)
+    p_reset.set_defaults(func=_cmd_reset)
 
     return parser
 

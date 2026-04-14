@@ -30,12 +30,13 @@ class PaperBotService:
     ) -> None:
         self.orchestrator = orchestrator or PaperService(config=config)
 
-        self.session_reset_hour = int(os.getenv("SESSION_RESET_HOUR", "7"))
         self.session_history_turns = int(os.getenv("SESSION_HISTORY_TURNS", "4"))
         self.session_reset_timezone = os.getenv("SESSION_RESET_TIMEZONE", "Asia/Seoul")
         self.max_summary_chars = int(os.getenv("SESSION_SUMMARY_MAX_CHARS", "1800"))
         self.sessions_dir = Path(os.getenv("SESSION_LOG_DIR", "sessions"))
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
+        self.session_state_dir = Path(os.getenv("SESSION_STATE_DIR", str(self.sessions_dir / "state")))
+        self.session_state_dir.mkdir(parents=True, exist_ok=True)
         self.parse_cache_dir = Path(os.getenv("PARSE_CACHE_DIR", "cache/parsed"))
         self.parse_cache_dir.mkdir(parents=True, exist_ok=True)
         self.summary_max_steps = int(os.getenv("SUMMARY_MAX_STEPS", "5"))
@@ -96,8 +97,6 @@ class PaperBotService:
     def _format_event(event: dict[str, Any]) -> str | None:
         name = event.get("event")
 
-        if name == "session_reset":
-            return f"[SESSION] {event.get('message', '세션 메모리를 초기화했습니다.')}"
         if name == "start":
             return f"[START] PDF: {event.get('pdf_path', '-')}"
         if name == "intent_planned":
@@ -174,20 +173,86 @@ class PaperBotService:
         safe = re.sub(r"[^A-Za-z0-9_.-]", "_", raw.strip())
         return safe or "default"
 
+    def _default_session(self, safe_session_id: str) -> dict[str, Any]:
+        return {
+            "summary": "",
+            "recent_turns": [],
+            "state": {"active_pdf": ""},
+            "trace_enabled": self.trace_default_on,
+            "log_file_name": self._new_log_file_name(safe_session_id),
+            "session_id_safe": safe_session_id,
+        }
+
+    def _session_state_path(self, safe_session_id: str) -> Path:
+        return self.session_state_dir / f"{safe_session_id}.json"
+
+    def _load_session_state(self, safe_session_id: str) -> dict[str, Any] | None:
+        path = self._session_state_path(safe_session_id)
+        if not path.exists():
+            return None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                return None
+            return payload
+        except Exception:
+            return None
+
+    def _save_session_state(self, safe_session_id: str, session: dict[str, Any]) -> None:
+        path = self._session_state_path(safe_session_id)
+        payload = {
+            "summary": str(session.get("summary", "")).strip(),
+            "recent_turns": session.get("recent_turns", []),
+            "state": session.get("state", {}),
+            "trace_enabled": bool(session.get("trace_enabled", self.trace_default_on)),
+            "log_file_name": str(session.get("log_file_name", "")).strip() or self._new_log_file_name(safe_session_id),
+            "session_id_safe": safe_session_id,
+            "updated_at": datetime.now(self.session_tz).isoformat(),
+        }
+        path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    def _normalize_session_shape(self, session: dict[str, Any], safe_session_id: str) -> dict[str, Any]:
+        normalized = self._default_session(safe_session_id)
+
+        if isinstance(session.get("summary"), str):
+            normalized["summary"] = session["summary"]
+        recent_turns = session.get("recent_turns", [])
+        if isinstance(recent_turns, list):
+            clean_turns: list[dict[str, str]] = []
+            for turn in recent_turns:
+                if not isinstance(turn, dict):
+                    continue
+                role = str(turn.get("role", "")).strip()
+                content = str(turn.get("content", "")).strip()
+                if role and content:
+                    clean_turns.append({"role": role, "content": content})
+            normalized["recent_turns"] = clean_turns
+
+        state = session.get("state", {})
+        if isinstance(state, dict):
+            normalized_state = {"active_pdf": str(state.get("active_pdf", "")).strip()}
+            normalized["state"] = normalized_state
+
+        normalized["trace_enabled"] = bool(session.get("trace_enabled", self.trace_default_on))
+
+        log_file_name = str(session.get("log_file_name", "")).strip()
+        if log_file_name:
+            normalized["log_file_name"] = log_file_name
+        normalized["session_id_safe"] = safe_session_id
+        return normalized
+
     def _get_or_create_session(self, session_id: str) -> dict[str, Any]:
         sid = self._safe_session_id(session_id)
         if sid not in self.sessions:
-            self.sessions[sid] = {
-                "summary": "",
-                "recent_turns": [],
-                "state": {"active_pdf": ""},
-                "last_reset_date": None,
-                "trace_enabled": self.trace_default_on,
-                "log_file_name": self._new_log_file_name(sid),
-            }
+            loaded = self._load_session_state(sid) or {}
+            self.sessions[sid] = self._normalize_session_shape(loaded, sid)
+        session = self.sessions[sid]
+        state = session.setdefault("state", {})
+        if not isinstance(state, dict):
+            session["state"] = {"active_pdf": ""}
         else:
-            state = self.sessions[sid].setdefault("state", {})
             state.setdefault("active_pdf", "")
+        session.setdefault("session_id_safe", sid)
         return self.sessions[sid]
 
     def _new_log_file_name(self, safe_session_id: str) -> str:
@@ -585,8 +650,10 @@ class PaperBotService:
         return improved or None, section_ids
 
     def set_trace_enabled(self, session_id: str, enabled: bool) -> bool:
+        sid = self._safe_session_id(session_id)
         session = self._get_or_create_session(session_id)
         session["trace_enabled"] = bool(enabled)
+        self._save_session_state(sid, session)
         return bool(session["trace_enabled"])
 
     def get_trace_enabled(self, session_id: str) -> bool:
@@ -596,27 +663,11 @@ class PaperBotService:
     def reset_session(self, session_id: str) -> None:
         session = self._get_or_create_session(session_id)
         sid = self._safe_session_id(session_id)
-        today = datetime.now(self.session_tz).date().isoformat()
         session["summary"] = ""
         session["recent_turns"] = []
         session["state"] = {"active_pdf": ""}
-        session["last_reset_date"] = today
         session["log_file_name"] = self._new_log_file_name(sid)
-
-    def _maybe_reset_session(self, session: dict[str, Any]) -> bool:
-        now = datetime.now(self.session_tz)
-        reset_point = now.replace(hour=self.session_reset_hour, minute=0, second=0, microsecond=0)
-        today = now.date().isoformat()
-
-        if now >= reset_point and session.get("last_reset_date") != today:
-            session["summary"] = ""
-            session["recent_turns"] = []
-            session["state"] = {"active_pdf": ""}
-            session["last_reset_date"] = today
-            sid = str(session.get("session_id_safe", "default"))
-            session["log_file_name"] = self._new_log_file_name(sid)
-            return True
-        return False
+        self._save_session_state(sid, session)
 
     def _resolve_effective_pdf_path(
         self,
@@ -812,15 +863,6 @@ class PaperBotService:
             if trace_enabled and on_trace is not None:
                 on_trace(line, event)
 
-        session_reset = self._maybe_reset_session(session)
-        if session_reset:
-            _emit_local(
-                {
-                    "event": "session_reset",
-                    "message": "매일 오전 7시 기준으로 대화 메모리를 초기화했습니다.",
-                }
-            )
-
         refined = self._refine_query(query)
         normalized_ko = str(refined.get("normalized_ko", query)).strip() or query
         english_query = str(refined.get("english", "")).strip()
@@ -888,6 +930,7 @@ class PaperBotService:
 
         self._update_memory(session, query, answer)
         self._append_session_log(session_id, session, query, answer, route, context_meta)
+        self._save_session_state(self._safe_session_id(session_id), session)
 
         return {
             "answer": answer,
@@ -895,7 +938,6 @@ class PaperBotService:
             "context_meta": context_meta,
             "trace": trace_lines,
             "raw_events": raw_events,
-            "session_reset": session_reset,
             "trace_enabled": trace_enabled,
         }
 
@@ -904,13 +946,11 @@ class PaperBotService:
         session = self._get_or_create_session(session_id)
         session["session_id_safe"] = self._safe_session_id(session_id)
 
-        # Keep daily reset policy consistent before morning briefing.
-        self._maybe_reset_session(session)
-
         pdf_paths = self._list_pdf_paths()
         if not pdf_paths:
             msg = f"[Daily 07:30 Briefing]\nPDF 파일이 없습니다. (dir: {self.orchestrator.config.pdf_dir})"
             self._update_memory(session, "[SYSTEM] daily briefing", msg)
+            self._save_session_state(self._safe_session_id(session_id), session)
             return {"ok": True, "message": msg, "count": 0}
 
         timestamp = datetime.now(self.session_tz).strftime("%Y-%m-%d %H:%M:%S %Z")
@@ -956,6 +996,7 @@ class PaperBotService:
 
         # Store briefing in the same chat session context for follow-up QA.
         self._update_memory(session, "[SYSTEM] daily briefing", briefing)
+        self._save_session_state(self._safe_session_id(session_id), session)
         return {
             "ok": True,
             "message": briefing,

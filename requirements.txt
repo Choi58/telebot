@@ -9,3 +9,5 @@ langchain-community
 langchain-openai
 langchain-text-splitters
 haystack-ai
+fastapi
+uvicorn
