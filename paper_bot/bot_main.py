@@ -13,8 +13,8 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from pypdf import PdfReader
 
-from orchestrator import OrchestratorConfig, PaperLLMOrchestrator
-from tools import tool_list_pdfs, tool_open_pdf
+from .paper_service import OrchestratorConfig, PaperService
+from legacy_experiments.tools import tool_list_pdfs, tool_open_pdf
 
 
 TraceCallback = Callable[[str, dict[str, Any]], None]
@@ -25,10 +25,10 @@ class PaperBotService:
 
     def __init__(
         self,
-        orchestrator: PaperLLMOrchestrator | None = None,
+        orchestrator: PaperService | None = None,
         config: OrchestratorConfig | None = None,
     ) -> None:
-        self.orchestrator = orchestrator or PaperLLMOrchestrator(config=config)
+        self.orchestrator = orchestrator or PaperService(config=config)
 
         self.session_reset_hour = int(os.getenv("SESSION_RESET_HOUR", "7"))
         self.session_history_turns = int(os.getenv("SESSION_HISTORY_TURNS", "4"))

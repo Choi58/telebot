@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import re
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import requests
 from pypdf import PdfReader
 
 
@@ -46,34 +48,125 @@ class ParsedPaper:
         }
 
 
-class PDFPaperParser:
-    """Import-friendly PDF paper parser (rule-based, no LLM dependency)."""
+class GROBIDPaperParser:
+    """GROBID-only parser."""
 
-    def __init__(self, max_pages: int | None = 20) -> None:
+    def __init__(
+        self,
+        grobid_url: str,
+        grobid_timeout_sec: int = 120,
+        max_pages: int | None = None,
+    ) -> None:
+        self.grobid_url = (grobid_url or "").rstrip("/")
+        self.grobid_timeout_sec = max(5, int(grobid_timeout_sec))
         self.max_pages = max_pages
-        self.numbered_header_re = re.compile(r"^\s*(\d+(?:\.\d+)*)(?:\.)?\s+(.+?)\s*$")
-        self.major_header_re = re.compile(
-            r"^\s*(ABSTRACT|INTRODUCTION|METHODS?|EXPERIMENTS?|RESULTS?|CONCLUSION|CONCLUSIONS|REFERENCES|KEYWORDS|CCS CONCEPTS)\s*$",
-            flags=re.IGNORECASE,
-        )
-        self.author_hint_re = re.compile(
-            r"(@|University|Institute|Department|Laboratory|School|College|Contributed equally)",
-            flags=re.IGNORECASE,
-        )
-        self.author_name_re = re.compile(r"^[A-Z][a-z]+(?: [A-Z][a-z]+){1,3}(?:[∗*†])?$")
+        self.last_backend_used = "grobid"
 
     @staticmethod
-    def _normalize_text(text: str) -> str:
-        text = text.replace("\u00a0", " ")
-        text = re.sub(r"\t+", " ", text)
+    def _tei_text(el: ET.Element | None) -> str:
+        if el is None:
+            return ""
+        text = " ".join(el.itertext())
+        text = re.sub(r"\s+", " ", text).strip()
         return text
 
-    @staticmethod
-    def _clean_paragraph(text: str) -> str:
-        text = re.sub(r"(?<=\w)-\n(?=\w)", "", text)
-        text = re.sub(r"\n+", " ", text)
-        text = re.sub(r"[ ]{2,}", " ", text)
-        return text.strip()
+    def _resolve_pages_used(self, pdf_path: Path, max_pages: int | None = None) -> int:
+        reader = PdfReader(str(pdf_path))
+        total_pages = len(reader.pages)
+        limit = self.max_pages if max_pages is None else max_pages
+        return total_pages if limit is None else min(total_pages, int(limit))
+
+    def _parse_div(self, div: ET.Element, ns: dict[str, str], idx_prefix: str) -> SectionNode:
+        head = self._tei_text(div.find("tei:head", ns)) or f"Section {idx_prefix}"
+        sec_id = div.attrib.get("n") or div.attrib.get("{http://www.w3.org/XML/1998/namespace}id")
+        if sec_id is not None:
+            sec_id = str(sec_id)
+
+        paragraphs: list[str] = []
+        for child in list(div):
+            tag = child.tag.split("}")[-1]
+            if tag == "p":
+                txt = self._tei_text(child)
+                if txt:
+                    paragraphs.append(txt)
+
+        node = SectionNode(id=sec_id, name=head, paragraphs=paragraphs)
+
+        div_children = [c for c in list(div) if c.tag.split("}")[-1] == "div"]
+        for j, child_div in enumerate(div_children, start=1):
+            child_idx = f"{idx_prefix}.{j}" if idx_prefix else str(j)
+            node.children.append(self._parse_div(child_div, ns, child_idx))
+        return node
+
+    def parse_pdf(self, pdf_path: str | Path, max_pages: int | None = None) -> ParsedPaper:
+        path = Path(pdf_path)
+        if not path.exists():
+            raise FileNotFoundError(f"PDF not found: {path}")
+        if not self.grobid_url:
+            raise RuntimeError("GROBID_URL is empty")
+
+        endpoint = f"{self.grobid_url}/api/processFulltextDocument"
+        with path.open("rb") as f:
+            files = {"input": (path.name, f, "application/pdf")}
+            data = {
+                "consolidateHeader": "0",
+                "consolidateCitations": "0",
+                "teiCoordinates": "false",
+            }
+            resp = requests.post(endpoint, files=files, data=data, timeout=self.grobid_timeout_sec)
+
+        if resp.status_code != 200:
+            raise RuntimeError(f"GROBID failed: {resp.status_code} {resp.text[:200]}")
+
+        root = ET.fromstring(resp.text)
+        ns = {"tei": "http://www.tei-c.org/ns/1.0"}
+
+        title = self._tei_text(root.find(".//tei:titleStmt/tei:title", ns))
+
+        authors: list[str] = []
+        for a in root.findall(".//tei:sourceDesc//tei:author", ns):
+            name = self._tei_text(a.find("tei:persName", ns)) or self._tei_text(a)
+            if name and name not in authors:
+                authors.append(name)
+
+        abstract_parts: list[str] = []
+        for p in root.findall(".//tei:profileDesc/tei:abstract//tei:p", ns):
+            txt = self._tei_text(p)
+            if txt:
+                abstract_parts.append(txt)
+        abstract = "\n\n".join(abstract_parts).strip()
+
+        meta: list[str] = []
+        for term in root.findall(".//tei:keywords//tei:term", ns):
+            txt = self._tei_text(term)
+            if txt:
+                meta.append(txt)
+        meta = list(dict.fromkeys(meta))
+
+        sections: list[SectionNode] = []
+        body = root.find(".//tei:text/tei:body", ns)
+        if body is not None:
+            divs = [d for d in list(body) if d.tag.split("}")[-1] == "div"]
+            for i, d in enumerate(divs, start=1):
+                sections.append(self._parse_div(d, ns, str(i)))
+
+        if not sections:
+            raise RuntimeError("GROBID returned no sections")
+
+        return ParsedPaper(
+            file_path=str(path.resolve()),
+            pages_used=self._resolve_pages_used(path, max_pages),
+            title=title,
+            authors=authors,
+            abstract=abstract,
+            meta=meta,
+            sections=sections,
+        )
+
+    def parse_directory(self, directory: str | Path) -> list[ParsedPaper]:
+        directory = Path(directory)
+        pdfs = sorted(directory.glob("*.pdf"))
+        return [self.parse_pdf(p) for p in pdfs]
 
     @staticmethod
     def _render_section_md(lines: list[str], node: SectionNode, depth: int = 0) -> None:
@@ -85,157 +178,7 @@ class PDFPaperParser:
             lines.append("- (no paragraphs)")
         lines.append("")
         for c in node.children:
-            PDFPaperParser._render_section_md(lines, c, depth + 1)
-
-    def parse_pdf(self, pdf_path: str | Path, max_pages: int | None = None) -> ParsedPaper:
-        pdf_path = Path(pdf_path)
-        reader = PdfReader(str(pdf_path))
-        total_pages = len(reader.pages)
-        limit_pages = self.max_pages if max_pages is None else max_pages
-        pages_used = total_pages if limit_pages is None else min(limit_pages, total_pages)
-
-        page_texts = [self._normalize_text(reader.pages[i].extract_text() or "") for i in range(pages_used)]
-        full_text = "\n\n".join(page_texts)
-        lines = [ln.rstrip() for ln in full_text.splitlines()]
-
-        headers: list[dict[str, Any]] = []
-        for i, raw in enumerate(lines):
-            line = raw.strip()
-            if not line:
-                continue
-
-            m = self.numbered_header_re.match(line)
-            if m:
-                sec_id = m.group(1)
-                title = m.group(2).strip()
-                inline_body = ""
-                glued = re.match(r"^(.+?\.)(\S.*)$", title)
-                if glued:
-                    title = glued.group(1).strip()
-                    inline_body = glued.group(2).strip()
-                headers.append(
-                    {
-                        "line": i,
-                        "type": "section",
-                        "id": sec_id,
-                        "title": title,
-                        "inline_body": inline_body,
-                    }
-                )
-                continue
-
-            m2 = self.major_header_re.match(line)
-            if m2:
-                key = m2.group(1).upper()
-                htype = "meta" if key in ("ABSTRACT", "KEYWORDS", "CCS CONCEPTS") else "section"
-                headers.append({"line": i, "type": htype, "id": None, "title": key, "inline_body": ""})
-
-        first_page_lines = [ln.strip() for ln in page_texts[0].splitlines() if ln.strip()] if page_texts else []
-
-        title = ""
-        for ln in first_page_lines[:20]:
-            if len(ln) < 8 or "@" in ln:
-                continue
-            if self.major_header_re.match(ln) or self.numbered_header_re.match(ln):
-                continue
-            title = ln
-            break
-
-        authors: list[str] = []
-        for ln in first_page_lines[:120]:
-            if self.major_header_re.match(ln):
-                break
-            if self.author_hint_re.search(ln) or self.author_name_re.match(ln):
-                authors.append(ln)
-
-        abstract_parts: list[str] = []
-        meta: list[str] = []
-        flat_sections: list[SectionNode] = []
-
-        offsets: list[int] = []
-        cur = 0
-        joined = "\n".join(lines)
-        for i, ln in enumerate(lines):
-            offsets.append(cur)
-            cur += len(ln)
-            if i != len(lines) - 1:
-                cur += 1
-
-        def slice_text(line_start: int, line_end_exclusive: int) -> str:
-            if not lines or line_start < 0 or line_start >= len(lines) or line_end_exclusive <= line_start:
-                return ""
-            start = offsets[line_start]
-            end = offsets[line_end_exclusive] if line_end_exclusive < len(lines) else len(joined)
-            return joined[start:end].strip()
-
-        headers_sorted = sorted(headers, key=lambda x: x["line"])
-
-        for idx, h in enumerate(headers_sorted):
-            next_line = headers_sorted[idx + 1]["line"] if idx + 1 < len(headers_sorted) else len(lines)
-            body = slice_text(h["line"] + 1, next_line)
-            inline_body = str(h.get("inline_body", "")).strip()
-            if inline_body:
-                body = f"{inline_body}\n{body}".strip() if body else inline_body
-
-            if h["type"] == "meta":
-                if h["title"] == "ABSTRACT":
-                    if body:
-                        abstract_parts.append(body)
-                else:
-                    meta.append(h["title"])
-                    if body:
-                        meta.append(body)
-                continue
-
-            if h["id"]:
-                name = f"{h['id']} {h['title']}".strip()
-                sec_id = str(h["id"])
-            else:
-                name = str(h["title"])
-                sec_id = None
-
-            section = SectionNode(id=sec_id, name=name)
-            if body:
-                raw_paragraphs = re.split(r"\n\s*\n+", body) if "\n\n" in body else [body]
-                cleaned = [self._clean_paragraph(p) for p in raw_paragraphs if p.strip()]
-                section.paragraphs.extend([p for p in cleaned if p])
-            flat_sections.append(section)
-
-        # Build numbered tree
-        section_map: dict[str, SectionNode] = {}
-        roots: list[SectionNode] = []
-
-        for s in flat_sections:
-            if s.id is not None:
-                section_map[s.id] = s
-
-        for s in flat_sections:
-            if s.id is None:
-                roots.append(s)
-                continue
-            parent_id = s.id.rsplit(".", 1)[0] if "." in s.id else None
-            if parent_id and parent_id in section_map:
-                section_map[parent_id].children.append(s)
-            else:
-                roots.append(s)
-
-        authors = list(dict.fromkeys(authors))
-        meta = list(dict.fromkeys(meta))
-
-        return ParsedPaper(
-            file_path=str(pdf_path.resolve()),
-            pages_used=pages_used,
-            title=title,
-            authors=authors,
-            abstract="\n\n".join(abstract_parts).strip(),
-            meta=meta,
-            sections=roots,
-        )
-
-    def parse_directory(self, directory: str | Path) -> list[ParsedPaper]:
-        directory = Path(directory)
-        pdfs = sorted(directory.glob("*.pdf"))
-        return [self.parse_pdf(p) for p in pdfs]
+            GROBIDPaperParser._render_section_md(lines, c, depth + 1)
 
     def to_markdown(self, paper: ParsedPaper) -> str:
         lines: list[str] = [
@@ -250,13 +193,11 @@ class PDFPaperParser:
         ]
 
         lines += [f"- {a}" for a in paper.authors] if paper.authors else ["- (none)"]
-
         lines += ["", "## Abstract", paper.abstract or "(none)"]
-
         lines += ["", "## Meta"]
         lines += [f"- {m}" for m in paper.meta] if paper.meta else ["- (none)"]
-
         lines += ["", "## Sections"]
+
         if paper.sections:
             for s in paper.sections:
                 self._render_section_md(lines, s, 0)
@@ -266,12 +207,23 @@ class PDFPaperParser:
         return "\n".join(lines).strip() + "\n"
 
 
-if __name__ == "__main__":
-    parser = PDFPaperParser(max_pages=20)
-    papers = parser.parse_directory("Papers")
-    out_dir = Path("samples")
-    out_dir.mkdir(parents=True, exist_ok=True)
-    for p in papers:
-        out = out_dir / f"{Path(p.file_path).stem}.md"
-        out.write_text(parser.to_markdown(p), encoding="utf-8")
-        print(f"saved: {out}")
+class PDFPaperParser(GROBIDPaperParser):
+    """Compatibility alias."""
+
+    def __init__(
+        self,
+        max_pages: int | None = None,
+        backend: str | None = None,
+        grobid_url: str | None = None,
+        grobid_timeout_sec: int = 120,
+    ) -> None:
+        if backend and backend.strip().lower() not in {"grobid", "auto"}:
+            raise ValueError(
+                f"Unsupported parser backend '{backend}'. "
+                "This project is fixed to GROBID-only."
+            )
+        super().__init__(
+            grobid_url=(grobid_url or ""),
+            grobid_timeout_sec=grobid_timeout_sec,
+            max_pages=max_pages,
+        )

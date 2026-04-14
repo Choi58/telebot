@@ -8,7 +8,7 @@ import telebot
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-from paper_bot import PaperBotService
+from paper_bot.bot_main import PaperBotService
 from settings import get_settings
 
 SETTINGS = get_settings()

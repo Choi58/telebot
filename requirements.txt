@@ -9,3 +9,4 @@ langchain-community
 langchain-openai
 langchain-text-splitters
 apscheduler
+haystack-ai
