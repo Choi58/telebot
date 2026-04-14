@@ -16,7 +16,7 @@ from langchain_openai import ChatOpenAI
 from .rag_pipeline import RagPipeline
 from settings import get_settings
 from .summary_pipeline import SummaryPipeline
-from legacy_experiments.tools import tool_list_pdfs, tool_open_pdf
+from .pdf_tools import tool_list_pdfs, tool_open_pdf
 
 
 @dataclass

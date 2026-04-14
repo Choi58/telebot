@@ -1,79 +1,31 @@
 from __future__ import annotations
 
+import argparse
 import json
-import os
-from pathlib import Path
+from typing import Any
 
 import telebot
-from apscheduler.schedulers.background import BackgroundScheduler
-from apscheduler.triggers.cron import CronTrigger
 
-from paper_bot.bot_main import PaperBotService
+from paper_bot import PaperBotService
 from settings import get_settings
 
-SETTINGS = get_settings()
-TELEGRAM_BOT_TOKEN = SETTINGS.telegram_bot_token
-
-if not TELEGRAM_BOT_TOKEN:
-    raise ValueError("TELEGRAM_BOT_TOKEN 이 비어 있습니다.")
-
-bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
-paper_bot = PaperBotService()
-
 MAX_TG_MSG_LEN = 3900
-DAILY_SUMMARY_HOUR = int(os.getenv("DAILY_SUMMARY_HOUR", "7"))
-DAILY_SUMMARY_MINUTE = int(os.getenv("DAILY_SUMMARY_MINUTE", "30"))
-DAILY_SUMMARY_TIMEZONE = os.getenv("DAILY_SUMMARY_TIMEZONE", "Asia/Seoul")
-SUBSCRIBERS_FILE = Path(os.getenv("DAILY_SUBSCRIBERS_FILE", "sessions/subscribers.json"))
-SUBSCRIBERS_FILE.parent.mkdir(parents=True, exist_ok=True)
 
 
-def _load_subscribers() -> set[int]:
-    if not SUBSCRIBERS_FILE.exists():
-        return set()
-    try:
-        data = json.loads(SUBSCRIBERS_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        return set()
-
-    if not isinstance(data, list):
-        return set()
-
-    out: set[int] = set()
-    for x in data:
-        try:
-            out.add(int(x))
-        except Exception:
-            continue
-    return out
+def _build_bot() -> telebot.TeleBot:
+    settings = get_settings()
+    token = settings.telegram_bot_token
+    if not token:
+        raise ValueError("TELEGRAM_BOT_TOKEN is empty.")
+    return telebot.TeleBot(token)
 
 
-def _save_subscribers() -> None:
-    SUBSCRIBERS_FILE.write_text(json.dumps(sorted(SUBSCRIBERS), ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def _add_subscriber(chat_id: int) -> bool:
-    if chat_id in SUBSCRIBERS:
-        return False
-    SUBSCRIBERS.add(chat_id)
-    _save_subscribers()
-    return True
-
-
-def _remove_subscriber(chat_id: int) -> bool:
-    if chat_id not in SUBSCRIBERS:
-        return False
-    SUBSCRIBERS.remove(chat_id)
-    _save_subscribers()
-    return True
-
-
-def _send_long_message(chat_id: int, text: str) -> None:
-    """Telegram message size guard (hard limit ~4096 chars)."""
-    remaining = text.strip()
+def _send_long_message(bot: telebot.TeleBot, chat_id: int, text: str) -> int:
+    remaining = (text or "").strip()
     if not remaining:
-        return
+        return 0
 
+    sent = 0
     while remaining:
         chunk = remaining[:MAX_TG_MSG_LEN]
         if len(remaining) > MAX_TG_MSG_LEN:
@@ -81,148 +33,116 @@ def _send_long_message(chat_id: int, text: str) -> None:
             if split_at > 200:
                 chunk = chunk[:split_at]
         bot.send_message(chat_id, chunk)
-        remaining = remaining[len(chunk):].lstrip("\n")
+        sent += 1
+        remaining = remaining[len(chunk) :].lstrip("\n")
+    return sent
 
 
-def _run_daily_briefing_job() -> None:
-    if not SUBSCRIBERS:
-        return
-
-    for chat_id in list(SUBSCRIBERS):
-        try:
-            result = paper_bot.generate_daily_briefing(session_id=str(chat_id))
-            message = str(result.get("message", "")).strip()
-            if message:
-                _send_long_message(chat_id, message)
-        except Exception as e:
-            _send_long_message(chat_id, f"[Daily 07:30 Briefing] 실패: {type(e).__name__}: {e}")
+def _print_result(payload: dict[str, Any]) -> None:
+    print(json.dumps(payload, ensure_ascii=False))
 
 
-def _start_scheduler() -> BackgroundScheduler:
-    scheduler = BackgroundScheduler(timezone=DAILY_SUMMARY_TIMEZONE)
-    trigger = CronTrigger(
-        hour=DAILY_SUMMARY_HOUR,
-        minute=DAILY_SUMMARY_MINUTE,
-        timezone=DAILY_SUMMARY_TIMEZONE,
-    )
-    scheduler.add_job(
-        _run_daily_briefing_job,
-        trigger=trigger,
-        id="daily_0730_briefing",
-        replace_existing=True,
-        max_instances=1,
-        coalesce=True,
-        misfire_grace_time=900,
-    )
-    scheduler.start()
-    return scheduler
+def _cmd_notify(args: argparse.Namespace) -> int:
+    bot = _build_bot()
+    chunks = _send_long_message(bot, args.chat_id, args.text)
+    _print_result({"ok": True, "mode": "notify", "chat_id": args.chat_id, "chunks_sent": chunks})
+    return 0
 
 
-@bot.message_handler(commands=["start"])
-def start_handler(message):
-    chat_id = message.chat.id
-    _add_subscriber(chat_id)
-    trace_enabled = paper_bot.get_trace_enabled(str(chat_id))
-    trace_text = "ON" if trace_enabled else "OFF"
-    bot.reply_to(
-        message,
-        "안녕하세요. Paper Bot 입니다.\n"
-        f"매일 {DAILY_SUMMARY_HOUR:02d}:{DAILY_SUMMARY_MINUTE:02d} ({DAILY_SUMMARY_TIMEZONE})에 "
-        "Papers 폴더 논문 요약을 자동으로 보냅니다.\n"
-        "질문하면 같은 세션 맥락으로 질의응답합니다.\n"
-        f"trace 상태: {trace_text}\n"
-        "명령어: /subscribe /unsubscribe /daily_now /trace /trace_on /trace_off /session_reset",
+def _cmd_answer(args: argparse.Namespace) -> int:
+    bot = _build_bot()
+    service = PaperBotService()
+    session_id = args.session_id or str(args.chat_id)
+
+    trace_lines: list[str] = []
+
+    def _on_trace(line: str, _: dict[str, Any]) -> None:
+        trace_lines.append(line)
+
+    result = service.answer_with_trace(
+        query=args.query,
+        session_id=session_id,
+        pdf_path=args.pdf_path,
+        on_trace=_on_trace,
+        trace_on=bool(args.trace),
     )
 
+    answer = str(result.get("answer", "")).strip() or "답변을 생성하지 못했습니다."
+    answer_chunks = _send_long_message(bot, args.chat_id, f"[ANSWER]\n{answer}")
 
-@bot.message_handler(commands=["subscribe"])
-def subscribe_handler(message):
-    added = _add_subscriber(message.chat.id)
-    if added:
-        bot.reply_to(message, "매일 07:30 요약 알림을 구독했습니다.")
-    else:
-        bot.reply_to(message, "이미 구독 중입니다.")
+    trace_chunks = 0
+    if args.send_trace and trace_lines:
+        trace_chunks = _send_long_message(bot, args.chat_id, "\n".join(trace_lines))
 
-
-@bot.message_handler(commands=["unsubscribe"])
-def unsubscribe_handler(message):
-    removed = _remove_subscriber(message.chat.id)
-    if removed:
-        bot.reply_to(message, "매일 07:30 요약 알림을 해지했습니다.")
-    else:
-        bot.reply_to(message, "현재 구독 상태가 아닙니다.")
-
-
-@bot.message_handler(commands=["daily_now"])
-def daily_now_handler(message):
-    chat_id = message.chat.id
-    bot.send_chat_action(chat_id, "typing")
-    try:
-        result = paper_bot.generate_daily_briefing(session_id=str(chat_id))
-        msg = str(result.get("message", "")).strip() or "브리핑 결과가 비어 있습니다."
-        _send_long_message(chat_id, msg)
-    except Exception as e:
-        bot.reply_to(message, f"오류가 발생했습니다: {type(e).__name__}: {e}")
+    _print_result(
+        {
+            "ok": True,
+            "mode": "answer",
+            "chat_id": args.chat_id,
+            "session_id": session_id,
+            "route": result.get("route"),
+            "answer_chunks_sent": answer_chunks,
+            "trace_chunks_sent": trace_chunks,
+        }
+    )
+    return 0
 
 
-@bot.message_handler(commands=["trace"])
-def trace_status_handler(message):
-    enabled = paper_bot.get_trace_enabled(str(message.chat.id))
-    state = "ON" if enabled else "OFF"
-    bot.reply_to(message, f"현재 trace 상태: {state}")
+def _cmd_daily_briefing(args: argparse.Namespace) -> int:
+    bot = _build_bot()
+    service = PaperBotService()
+    session_id = args.session_id or str(args.chat_id)
+
+    result = service.generate_daily_briefing(session_id=session_id)
+    message = str(result.get("message", "")).strip()
+    chunks = _send_long_message(bot, args.chat_id, message)
+
+    _print_result(
+        {
+            "ok": True,
+            "mode": "daily-briefing",
+            "chat_id": args.chat_id,
+            "session_id": session_id,
+            "papers": result.get("count", 0),
+            "chunks_sent": chunks,
+            "cache_hits": result.get("cache_hits", 0),
+            "pages_used": result.get("pages_used", 0),
+        }
+    )
+    return 0
 
 
-@bot.message_handler(commands=["trace_on"])
-def trace_on_handler(message):
-    paper_bot.set_trace_enabled(str(message.chat.id), True)
-    bot.reply_to(message, "trace를 켰습니다. 다음 질문부터 중간 로그를 출력합니다.")
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="n8n-oriented Telegram notifier entrypoint")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_notify = sub.add_parser("notify", help="send plain text to Telegram")
+    p_notify.add_argument("--chat-id", type=int, required=True)
+    p_notify.add_argument("--text", required=True)
+    p_notify.set_defaults(func=_cmd_notify)
+
+    p_answer = sub.add_parser("answer", help="run QA then send answer to Telegram")
+    p_answer.add_argument("--chat-id", type=int, required=True)
+    p_answer.add_argument("--query", required=True)
+    p_answer.add_argument("--session-id", default="")
+    p_answer.add_argument("--pdf-path", default=None)
+    p_answer.add_argument("--trace", action="store_true", help="enable trace generation")
+    p_answer.add_argument("--send-trace", action="store_true", help="send trace lines to Telegram")
+    p_answer.set_defaults(func=_cmd_answer)
+
+    p_daily = sub.add_parser("daily-briefing", help="generate daily briefing and send to Telegram")
+    p_daily.add_argument("--chat-id", type=int, required=True)
+    p_daily.add_argument("--session-id", default="")
+    p_daily.set_defaults(func=_cmd_daily_briefing)
+
+    return parser
 
 
-@bot.message_handler(commands=["trace_off"])
-def trace_off_handler(message):
-    paper_bot.set_trace_enabled(str(message.chat.id), False)
-    bot.reply_to(message, "trace를 껐습니다. 다음 질문부터 중간 로그를 숨깁니다.")
-
-
-@bot.message_handler(commands=["session_reset"])
-def session_reset_handler(message):
-    paper_bot.reset_session(str(message.chat.id))
-    bot.reply_to(message, "세션 메모리를 수동 초기화했습니다.")
-
-
-@bot.message_handler(func=lambda message: message.text is not None)
-def text_handler(message):
-    user_text = message.text.strip()
-    if not user_text:
-        bot.reply_to(message, "텍스트를 보내주세요.")
-        return
-
-    chat_id = message.chat.id
-    _add_subscriber(chat_id)
-    bot.send_chat_action(chat_id, "typing")
-
-    def _stream_trace(line: str, _: dict):
-        _send_long_message(chat_id, line)
-
-    try:
-        result = paper_bot.answer_with_trace(
-            query=user_text,
-            session_id=str(chat_id),
-            on_trace=_stream_trace,
-            trace_on=paper_bot.get_trace_enabled(str(chat_id)),
-        )
-        answer = result.get("answer", "")
-        if not answer:
-            answer = "답변을 생성하지 못했습니다."
-        _send_long_message(chat_id, f"[ANSWER]\n{answer}")
-    except Exception as e:
-        bot.reply_to(message, f"오류가 발생했습니다: {type(e).__name__}: {e}")
-
-
-SUBSCRIBERS = _load_subscribers()
-SCHEDULER: BackgroundScheduler | None = None
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    return int(args.func(args))
 
 
 if __name__ == "__main__":
-    SCHEDULER = _start_scheduler()
-    bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30)
+    raise SystemExit(main())

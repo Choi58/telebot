@@ -14,7 +14,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from pypdf import PdfReader
 
 from .paper_service import OrchestratorConfig, PaperService
-from legacy_experiments.tools import tool_list_pdfs, tool_open_pdf
+from .pdf_tools import tool_list_pdfs, tool_open_pdf
 
 
 TraceCallback = Callable[[str, dict[str, Any]], None]
