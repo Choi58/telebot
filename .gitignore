@@ -19,6 +19,7 @@ env/
 # 환경변수
 .env
 .env.*
+!.env.example
 
 # sentence-transformers 캐시
 .cache/
