@@ -11,3 +11,4 @@ langchain-text-splitters
 haystack-ai
 fastapi
 uvicorn
+tqdm

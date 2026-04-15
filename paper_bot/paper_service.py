@@ -436,6 +436,22 @@ class PaperService:
         self.summary_chunk_ids = used_chunk_ids
         self.mode = "qa"
 
+    def apply_briefing_summary_cache(
+        self,
+        *,
+        summary_text: str,
+        used_sections: list[str] | None = None,
+        used_chunk_ids: list[str] | None = None,
+    ) -> None:
+        text = str(summary_text or "").strip()
+        if not text:
+            return
+        self.summary_cache = text
+        self.summary_sections = [str(x) for x in (used_sections or []) if str(x).strip()]
+        self.summary_chunk_ids = [str(x) for x in (used_chunk_ids or []) if str(x).strip()]
+        # QA path can reuse this without forcing another summary pre-run.
+        self.mode = "qa"
+
     @staticmethod
     def _make_result(
         *,
@@ -509,9 +525,24 @@ class PaperService:
             index_cache_hit=cache_hit,
         )
 
-        # Step 1: summary pre-run once, then transition to QA mode.
-        if self.mode != "qa":
-            self._ensure_summary_ready(paper_index)
+        # Step 1: only ensure summary when user explicitly asks for summary.
+        if ask_summary and (self.mode != "qa" or not self.summary_cache):
+            try:
+                self._ensure_summary_ready(paper_index)
+            except Exception as e:
+                emit("fallback_answer", reason=f"summary_pipeline_error:{type(e).__name__}")
+                result = self._make_result(
+                    route="summary" if ask_summary else "qa",
+                    pdf_path=target_pdf,
+                    answer=f"요약 생성 실패: {type(e).__name__}: {e}",
+                    used_sections=[],
+                    used_chunk_ids=[],
+                    check_reason="summary_pipeline_error",
+                    pages_used=pages_used,
+                    index_cache_hit=cache_hit,
+                )
+                emit("completed", route=result["route"], iterations_used=1, used_section_names=[])
+                return result
             emit(
                 "context_selected",
                 iteration=1,
@@ -551,7 +582,22 @@ class PaperService:
             return result
 
         emit("context_selected", iteration=1, section_names=used_sections, chunk_ids=used_chunk_ids)
-        answer = self.qa_cited_chain.invoke({"question": question, "context": context}).strip()
+        try:
+            answer = self.qa_cited_chain.invoke({"question": question, "context": context}).strip()
+        except Exception as e:
+            emit("fallback_answer", reason=f"qa_chain_error:{type(e).__name__}")
+            result = self._make_result(
+                route="qa",
+                pdf_path=target_pdf,
+                answer=f"답변 생성 실패: {type(e).__name__}: {e}",
+                used_sections=used_sections,
+                used_chunk_ids=used_chunk_ids,
+                check_reason="qa_chain_error",
+                pages_used=pages_used,
+                index_cache_hit=cache_hit,
+            )
+            emit("completed", route="qa", iterations_used=1, used_section_names=used_sections)
+            return result
         if not answer:
             emit("fallback_answer", reason="empty_answer")
             answer = "근거 부족: 답변을 생성하지 못했습니다."

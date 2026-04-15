@@ -93,7 +93,7 @@ def _cmd_daily_briefing(args: argparse.Namespace) -> int:
     service = PaperBotService()
     session_id = args.session_id or str(args.chat_id)
 
-    result = service.generate_daily_briefing(session_id=session_id)
+    result = service.generate_daily_briefing(session_id=session_id, max_papers=args.max_papers)
     message = str(result.get("message", "")).strip()
     chunks = _send_long_message(bot, args.chat_id, message)
 
@@ -150,6 +150,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_daily = sub.add_parser("daily-briefing", help="generate daily briefing and send to Telegram")
     p_daily.add_argument("--chat-id", type=int, required=True)
     p_daily.add_argument("--session-id", default="")
+    p_daily.add_argument("--max-papers", type=int, default=None)
     p_daily.set_defaults(func=_cmd_daily_briefing)
 
     p_reset = sub.add_parser("reset", help="reset session memory and persist cleared state")

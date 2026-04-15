@@ -52,6 +52,7 @@ def _send_long_message(bot: telebot.TeleBot, chat_id: int, text: str) -> int:
 class DailyBriefingRequest(BaseModel):
     chat_id: int
     session_id: str | None = None
+    max_papers: int | None = None
 
 
 class AnswerRequest(BaseModel):
@@ -80,7 +81,7 @@ def daily_briefing(payload: DailyBriefingRequest, x_api_key: str | None = Header
     service = PaperBotService()
     session_id = (payload.session_id or "").strip() or str(payload.chat_id)
 
-    result = service.generate_daily_briefing(session_id=session_id)
+    result = service.generate_daily_briefing(session_id=session_id, max_papers=payload.max_papers)
     message = str(result.get("message", "")).strip()
     chunks = _send_long_message(bot, payload.chat_id, message)
 
@@ -89,6 +90,7 @@ def daily_briefing(payload: DailyBriefingRequest, x_api_key: str | None = Header
         "mode": "daily-briefing",
         "chat_id": payload.chat_id,
         "session_id": session_id,
+        "message": message,
         "papers": result.get("count", 0),
         "chunks_sent": chunks,
         "cache_hits": result.get("cache_hits", 0),

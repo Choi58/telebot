@@ -38,3 +38,5 @@ legacy_experiments/
 # session logs
 session/
 sessions/
+
+daily-briefing-workflow.json

@@ -178,6 +178,7 @@ class PaperBotService:
             "summary": "",
             "recent_turns": [],
             "state": {"active_pdf": ""},
+            "briefing_cache": {},
             "trace_enabled": self.trace_default_on,
             "log_file_name": self._new_log_file_name(safe_session_id),
             "session_id_safe": safe_session_id,
@@ -204,6 +205,7 @@ class PaperBotService:
             "summary": str(session.get("summary", "")).strip(),
             "recent_turns": session.get("recent_turns", []),
             "state": session.get("state", {}),
+            "briefing_cache": session.get("briefing_cache", {}),
             "trace_enabled": bool(session.get("trace_enabled", self.trace_default_on)),
             "log_file_name": str(session.get("log_file_name", "")).strip() or self._new_log_file_name(safe_session_id),
             "session_id_safe": safe_session_id,
@@ -233,6 +235,24 @@ class PaperBotService:
             normalized_state = {"active_pdf": str(state.get("active_pdf", "")).strip()}
             normalized["state"] = normalized_state
 
+        briefing_cache = session.get("briefing_cache", {})
+        if isinstance(briefing_cache, dict):
+            clean_cache: dict[str, dict[str, Any]] = {}
+            for k, v in briefing_cache.items():
+                key = str(k).strip()
+                if not key or not isinstance(v, dict):
+                    continue
+                summary_text = str(v.get("summary", "")).strip()
+                if not summary_text:
+                    continue
+                clean_cache[key] = {
+                    "summary": summary_text,
+                    "used_sections": [str(x) for x in (v.get("used_sections", []) or []) if str(x).strip()],
+                    "used_chunk_ids": [str(x) for x in (v.get("used_chunk_ids", []) or []) if str(x).strip()],
+                    "title": str(v.get("title", "")).strip(),
+                }
+            normalized["briefing_cache"] = clean_cache
+
         normalized["trace_enabled"] = bool(session.get("trace_enabled", self.trace_default_on))
 
         log_file_name = str(session.get("log_file_name", "")).strip()
@@ -252,8 +272,54 @@ class PaperBotService:
             session["state"] = {"active_pdf": ""}
         else:
             state.setdefault("active_pdf", "")
+        briefing_cache = session.setdefault("briefing_cache", {})
+        if not isinstance(briefing_cache, dict):
+            session["briefing_cache"] = {}
         session.setdefault("session_id_safe", sid)
         return self.sessions[sid]
+
+    @staticmethod
+    def _briefing_cache_key(pdf_path: str | Path) -> str:
+        p = Path(str(pdf_path))
+        try:
+            return str(p.resolve())
+        except Exception:
+            return str(p)
+
+    def _apply_briefing_cache_to_orchestrator(self, session: dict[str, Any], effective_pdf_path: str | None) -> bool:
+        cache = session.get("briefing_cache", {})
+        if not isinstance(cache, dict) or not cache:
+            return False
+
+        candidates: list[str] = []
+        if effective_pdf_path:
+            candidates.append(self._briefing_cache_key(effective_pdf_path))
+            candidates.append(str(effective_pdf_path))
+        state = session.get("state", {})
+        if isinstance(state, dict):
+            active_pdf = str(state.get("active_pdf", "")).strip()
+            if active_pdf:
+                candidates.append(self._briefing_cache_key(active_pdf))
+                candidates.append(active_pdf)
+
+        seen: set[str] = set()
+        for key in candidates:
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            payload = cache.get(key)
+            if not isinstance(payload, dict):
+                continue
+            summary_text = str(payload.get("summary", "")).strip()
+            if not summary_text:
+                continue
+            self.orchestrator.apply_briefing_summary_cache(
+                summary_text=summary_text,
+                used_sections=[str(x) for x in (payload.get("used_sections", []) or []) if str(x).strip()],
+                used_chunk_ids=[str(x) for x in (payload.get("used_chunk_ids", []) or []) if str(x).strip()],
+            )
+            return True
+        return False
 
     def _new_log_file_name(self, safe_session_id: str) -> str:
         stamp = datetime.now(self.session_tz).strftime("%Y%m%d_%H%M%S")
@@ -883,6 +949,7 @@ class PaperBotService:
             user_query=query,
             explicit_pdf_path=pdf_path,
         )
+        used_briefing_cache = self._apply_briefing_cache_to_orchestrator(session, effective_pdf_path)
         if effective_pdf_path and trace_enabled:
             _emit_local(
                 {
@@ -890,6 +957,8 @@ class PaperBotService:
                     "pdf_path": effective_pdf_path,
                 }
             )
+        if used_briefing_cache:
+            _emit_local({"event": "context_selected", "iteration": 0, "section_names": ["briefing_cache"], "chunk_ids": []})
 
         retrieval_query = normalized_ko
         if english_query:
@@ -941,12 +1010,15 @@ class PaperBotService:
             "trace_enabled": trace_enabled,
         }
 
-    def generate_daily_briefing(self, session_id: str) -> dict[str, Any]:
-        """Create 07:30 daily summaries using parse-cache + iterative refinement loop."""
+    def generate_daily_briefing(self, session_id: str, max_papers: int | None = None) -> dict[str, Any]:
+        """Create 07:30 daily summaries using SummaryPipeline and persist per-paper briefing cache."""
         session = self._get_or_create_session(session_id)
         session["session_id_safe"] = self._safe_session_id(session_id)
 
         pdf_paths = self._list_pdf_paths()
+        if max_papers is not None:
+            max_n = max(1, int(max_papers))
+            pdf_paths = pdf_paths[:max_n]
         if not pdf_paths:
             msg = f"[Daily 07:30 Briefing]\nPDF 파일이 없습니다. (dir: {self.orchestrator.config.pdf_dir})"
             self._update_memory(session, "[SYSTEM] daily briefing", msg)
@@ -957,38 +1029,45 @@ class PaperBotService:
         lines = [f"[Daily 07:30 Briefing] {timestamp}", f"총 {len(pdf_paths)}개 논문 브리핑"]
         total_pages_used = 0
         cache_hits = 0
+        briefing_cache = session.setdefault("briefing_cache", {})
+        if not isinstance(briefing_cache, dict):
+            briefing_cache = {}
+            session["briefing_cache"] = briefing_cache
 
         for path in pdf_paths:
             try:
-                parsed, from_cache = self._build_or_load_parsed(path)
-                if from_cache:
+                index_doc, index_cache_hit = self.orchestrator._build_or_load_index(str(path))
+                if index_cache_hit:
                     cache_hits += 1
-                title = self._resolve_paper_title(path, parsed)
-                pages_used = int(parsed.get("pages_used") or 0)
+                title = str(index_doc.get("title", "")).strip() or path.stem
+                pages_used = int(index_doc.get("pages_used") or 0)
                 total_pages_used += pages_used
 
                 question = (
                     f"{path.name} 논문을 아침 브리핑용으로 요약해줘. "
                     "핵심 기여, 방법, 결과 중심으로 간결하게."
                 )
-                paper_core, sec_summaries, loop_meta = self._iterative_section_summaries(
-                    parsed=parsed,
-                    title=title,
+                summary_text, used_sections, used_chunk_ids = self.orchestrator.summary_pipeline.build_hierarchical_summary(
                     question=question,
+                    paper_index=index_doc,
                 )
                 lines.append(f"\n## {title} ({path.name})")
-                lines.append(f"### 논문 핵심\n{paper_core or '(요약 없음)'}")
-                lines.append("### 섹션별 요약")
-                if sec_summaries:
-                    for sec_name, sec_summary in sec_summaries:
-                        lines.append(f"- {sec_name}: {sec_summary or '(요약 없음)'}")
-                else:
-                    lines.append("- (섹션 요약 없음)")
+                lines.append(summary_text or "(요약 없음)")
                 lines.append(
-                    f"- meta: cache={'hit' if from_cache else 'miss'}, "
-                    f"iterations={loop_meta.get('iterations_used')}, "
-                    f"sections={loop_meta.get('sections_used')}"
+                    f"- meta: cache={'hit' if index_cache_hit else 'miss'}, "
+                    f"sections={len(used_sections)}"
                 )
+
+                key = self._briefing_cache_key(path)
+                briefing_cache[key] = {
+                    "summary": str(summary_text or "").strip(),
+                    "used_sections": used_sections,
+                    "used_chunk_ids": used_chunk_ids,
+                    "title": title,
+                }
+                session_state = session.setdefault("state", {})
+                if isinstance(session_state, dict):
+                    session_state["active_pdf"] = key
             except Exception as e:
                 lines.append(f"\n## {path.name}\n요약 실패: {type(e).__name__}: {e}")
 

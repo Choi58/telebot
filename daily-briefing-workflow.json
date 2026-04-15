@@ -1,5 +1,5 @@
 {
-  "name": "Daily Briefing (telebot API)",
+  "name": "Daily Briefing + Follow-up QA (telebot API)",
   "nodes": [
     {
       "parameters": {
@@ -16,7 +16,7 @@
       "typeVersion": 1.3,
       "position": [
         40,
-        40
+        20
       ],
       "id": "c4a2e0e4-8f0c-4d57-a6c8-3a0f6f12f001",
       "name": "Schedule Trigger"
@@ -27,13 +27,24 @@
         "url": "http://host.docker.internal:8000/daily-briefing",
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={\"chat_id\": 8623134647, \"session_id\": \"8623134647\"}"
+        "jsonBody": "={\"chat_id\": 8623134647, \"session_id\": \"8623134647\", \"max_papers\": 1}",
+        "sendHeaders": true,
+        "specifyHeaders": "json",
+        "jsonHeaders": "={\"Content-Type\": \"application/json\", \"Accept\": \"application/json\"}",
+        "responseFormat": "json",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true
+            }
+          }
+        }
       },
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [
         280,
-        40
+        20
       ],
       "id": "c4a2e0e4-8f0c-4d57-a6c8-3a0f6f12f002",
       "name": "Call Daily Briefing API"
@@ -41,21 +52,380 @@
     {
       "parameters": {
         "chatId": "8623134647",
-        "text": "={{ $json.ok ? `Daily briefing 실행 완료\\n- papers: ${$json.papers}\\n- cache_hits: ${$json.cache_hits}\\n- pages_used: ${$json.pages_used}` : `Daily briefing 실행 실패\\n- 응답: ${JSON.stringify($json)}` }}",
+        "text": "={{ (() => {\n  const body = ($json && typeof $json.body === 'object') ? $json.body : $json;\n  const ok = !!(body && body.ok);\n  if (ok) {\n    return `Daily briefing 실행 완료\\n- papers: ${body.papers || 0}\\n- cache_hits: ${body.cache_hits || 0}\\n- pages_used: ${body.pages_used || 0}\\n\\n후속 질문은 그냥 메시지로 보내면, 같은 세션 기준으로 답변해요.\\n세션 초기화는 quit 입력 또는 매일 12:00에 실행됩니다.`;\n  }\n  const status = $json.statusCode || body.statusCode || '-';\n  const msg = (body && body.detail) ? String(body.detail) : '응답 본문을 확인해주세요.';\n  return `Daily briefing 실행 실패\\n- status: ${status}\\n- detail: ${msg}`;\n})() }}",
         "additionalFields": {}
       },
       "type": "n8n-nodes-base.telegram",
       "typeVersion": 1.2,
       "position": [
         520,
-        40
+        20
       ],
       "id": "c4a2e0e4-8f0c-4d57-a6c8-3a0f6f12f003",
-      "name": "Notify Status",
+      "name": "Notify Daily Status",
       "credentials": {
         "telegramApi": {
           "id": "z79ojtOIHdtLhPsN",
           "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "updates": [
+          "message"
+        ],
+        "additionalFields": {}
+      },
+      "type": "n8n-nodes-base.telegramTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        40,
+        260
+      ],
+      "id": "c4a2e0e4-8f0c-4d57-a6c8-3a0f6f12f010",
+      "name": "Telegram Trigger",
+      "credentials": {
+        "telegramApi": {
+          "id": "z79ojtOIHdtLhPsN",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "version": 2,
+            "leftValue": "",
+            "caseSensitive": false,
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "43a33b79-31cf-45b9-a8e9-64ad98a5f4e4",
+              "leftValue": "={{ ($json.message && $json.message.text) ? $json.message.text.trim() : '' }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        280,
+        260
+      ],
+      "id": "c4a2e0e4-8f0c-4d57-a6c8-3a0f6f12f011",
+      "name": "Has Text Message?"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "version": 2,
+            "leftValue": "",
+            "caseSensitive": false,
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "f5f695dc-c184-4ef6-b413-d66f35f2db4b",
+              "leftValue": "={{ ($json.message && $json.message.text) ? $json.message.text.trim().toLowerCase() : '' }}",
+              "rightValue": "quit",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        520,
+        260
+      ],
+      "id": "c4a2e0e4-8f0c-4d57-a6c8-3a0f6f12f014",
+      "name": "Is Quit Command?"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://host.docker.internal:8000/reset",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { \"chat_id\": Number($json.message.chat.id), \"session_id\": String($json.message.chat.id) } }}",
+        "sendHeaders": true,
+        "specifyHeaders": "json",
+        "jsonHeaders": "={\"Content-Type\": \"application/json\", \"Accept\": \"application/json\"}"
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        760,
+        200
+      ],
+      "id": "c4a2e0e4-8f0c-4d57-a6c8-3a0f6f12f015",
+      "name": "Call Reset API (quit)"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://host.docker.internal:8000/answer",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { \"chat_id\": $json.chat_id, \"session_id\": $json.session_id, \"query\": $json.query, \"trace\": false, \"send_trace\": false } }}",
+        "sendHeaders": true,
+        "specifyHeaders": "json",
+        "jsonHeaders": "={\"Content-Type\": \"application/json\", \"Accept\": \"application/json\"}"
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        760,
+        320
+      ],
+      "id": "c4a2e0e4-8f0c-4d57-a6c8-3a0f6f12f012",
+      "name": "Call Answer API"
+    },
+    {
+      "parameters": {
+        "chatId": "={{$json.message.chat.id}}",
+        "text": "텍스트 메시지만 처리할 수 있어요. 질문을 텍스트로 보내주세요.",
+        "additionalFields": {}
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        520,
+        380
+      ],
+      "id": "c4a2e0e4-8f0c-4d57-a6c8-3a0f6f12f013",
+      "name": "Notify Follow-up Error",
+      "credentials": {
+        "telegramApi": {
+          "id": "z79ojtOIHdtLhPsN",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "triggerAtHour": 12,
+              "triggerAtMinute": 0
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.3,
+      "position": [
+        40,
+        520
+      ],
+      "id": "c4a2e0e4-8f0c-4d57-a6c8-3a0f6f12f020",
+      "name": "Noon Reset Trigger"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://host.docker.internal:8000/reset",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\"chat_id\": 8623134647, \"session_id\": \"8623134647\"}",
+        "sendHeaders": true,
+        "specifyHeaders": "json",
+        "jsonHeaders": "={\"Content-Type\": \"application/json\", \"Accept\": \"application/json\"}"
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        280,
+        520
+      ],
+      "id": "c4a2e0e4-8f0c-4d57-a6c8-3a0f6f12f021",
+      "name": "Call Reset API (noon)"
+    },
+    {
+      "parameters": {
+        "chatId": "8623134647",
+        "text": "세션이 오후 12:00 기준으로 자동 초기화되었습니다.",
+        "additionalFields": {}
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        520,
+        520
+      ],
+      "id": "c4a2e0e4-8f0c-4d57-a6c8-3a0f6f12f022",
+      "name": "Notify Noon Reset",
+      "credentials": {
+        "telegramApi": {
+          "id": "z79ojtOIHdtLhPsN",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const payload = ($json && typeof $json === 'object') ? $json : {};\nconst body = (payload.body && typeof payload.body === 'object') ? payload.body : {};\nconst data = (payload.data && typeof payload.data === 'object') ? payload.data : {};\nconst bodyData = (body.data && typeof body.data === 'object') ? body.data : {};\n\nconst msgCandidates = [\n  body.message,\n  bodyData.message,\n  data.message,\n  payload.message,\n  typeof payload.body === 'string' ? payload.body : '',\n  typeof payload.data === 'string' ? payload.data : ''\n].map(v => String(v || '').trim()).filter(Boolean);\n\nlet full = msgCandidates[0] || '';\nif (!full) {\n  const papers = Number(body.papers || bodyData.papers || payload.papers || 0);\n  const cacheHits = Number(body.cache_hits || bodyData.cache_hits || payload.cache_hits || 0);\n  const pagesUsed = Number(body.pages_used || bodyData.pages_used || payload.pages_used || 0);\n  full = `[Daily Briefing]\\n브리핑 본문(message)이 응답에 없어 통계만 기록합니다.\\n- papers: ${papers}\\n- cache_hits: ${cacheHits}\\n- pages_used: ${pagesUsed}`;\n}\n\nconst sessionId = String(body.session_id || bodyData.session_id || payload.session_id || '8623134647');\nconst briefingDate = new Date().toISOString();\nconst lines = full.split(/\\r?\\n/);\n\nconst paperHeaderRe = /^##\\s+(.+?)\\s+\\(([^)]+\\.pdf)\\)\\s*$/i;\nconst papers = [];\nlet current = null;\n\nfor (const rawLine of lines) {\n  const line = String(rawLine || '');\n  const m = line.match(paperHeaderRe);\n  if (m) {\n    if (current) papers.push(current);\n    current = { title: String(m[1] || '').trim(), fileName: String(m[2] || '').trim(), bodyLines: [] };\n    continue;\n  }\n  if (current) current.bodyLines.push(line);\n}\nif (current) papers.push(current);\n\nconst out = [];\nfor (const p of papers) {\n  const bodyText = p.bodyLines.join('\\n').trim();\n  const short = bodyText.slice(0, 500);\n  const bodyChunks = [];\n  for (let i = 0; i < bodyText.length; i += 1800) bodyChunks.push(bodyText.slice(i, i + 1800));\n\n  const titleOut = (p.title || p.fileName || 'Untitled Paper').trim();\n  const paperId = p.fileName\n    ? p.fileName.replace(/\\.pdf$/i, '')\n    : titleOut.toLowerCase().replace(/[^a-z0-9가-힣]+/g, '-').replace(/^-+|-+$/g, '');\n\n  out.push({\n    json: {\n      notion_summary_db_id: '343eaf7ffa74807ab5bce732e2fe23d3',\n      title: titleOut,\n      paper_id: paperId || 'unknown-paper',\n      file_name: p.fileName || '',\n      session_id: sessionId,\n      briefing_date: briefingDate,\n      summary_short: short,\n      summary_chunks: bodyChunks.length ? bodyChunks : [short],\n      processed: true\n    }\n  });\n}\n\nif (!out.length) {\n  const short = full.slice(0, 500);\n  const bodyChunks = [];\n  for (let i = 0; i < full.length; i += 1800) bodyChunks.push(full.slice(i, i + 1800));\n  out.push({ json: {\n    notion_summary_db_id: '343eaf7ffa74807ab5bce732e2fe23d3',\n    title: `Daily Briefing ${new Date().toISOString().slice(0,10)}`,\n    paper_id: `briefing-${new Date().toISOString().slice(0,10)}`,\n    file_name: '',\n    session_id: sessionId,\n    briefing_date: briefingDate,\n    summary_short: short,\n    summary_chunks: bodyChunks.length ? bodyChunks : [short],\n    processed: true\n  }});\n}\n\nreturn out;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        760,
+        20
+      ],
+      "id": "c4a2e0e4-8f0c-4d57-a6c8-3a0f6f12f030",
+      "name": "Prepare Daily Notion Payload"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.notion.com/v1/pages",
+        "sendHeaders": true,
+        "specifyHeaders": "keypair",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { parent: { database_id: $json.notion_summary_db_id }, properties: { Name: { title: [{ text: { content: $json.title } }] }, Date: { date: { start: $json.briefing_date } }, SessionID: { rich_text: [{ text: { content: $json.session_id } }] }, PaperID: { rich_text: [{ text: { content: $json.paper_id } }] }, FileName: { rich_text: [{ text: { content: $json.file_name } }] }, SummaryShort: { rich_text: [{ text: { content: $json.summary_short } }] }, Processed: { checkbox: !!$json.processed } }, children: ($json.summary_chunks || []).map(c => ({ object: \"block\", type: \"paragraph\", paragraph: { rich_text: [{ type: \"text\", text: { content: c } }] } })) } }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "headerParametersUi": {
+          "parameter": [
+            {
+              "name": "Notion-Version",
+              "value": "2022-06-28"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1010,
+        20
+      ],
+      "id": "c4a2e0e4-8f0c-4d57-a6c8-3a0f6f12f031",
+      "name": "Notion Upsert Daily Summary",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_ME_NOTION_HEADER_AUTH_CRED_ID",
+          "name": "Notion Header Auth"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "keepOnlySet": true,
+        "values": {
+          "number": [
+            {
+              "name": "chat_id",
+              "value": "={{Number($json.message.chat.id)}}"
+            }
+          ],
+          "string": [
+            {
+              "name": "session_id",
+              "value": "={{String($json.message.chat.id)}}"
+            },
+            {
+              "name": "query",
+              "value": "={{$json.message.text}}"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        760,
+        320
+      ],
+      "id": "c4a2e0e4-8f0c-4d57-a6c8-3a0f6f12f032",
+      "name": "Prepare QA Request"
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combinationMode": "mergeByPosition",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        1010,
+        320
+      ],
+      "id": "c4a2e0e4-8f0c-4d57-a6c8-3a0f6f12f033",
+      "name": "Merge QA Request+Answer"
+    },
+    {
+      "parameters": {
+        "jsCode": "const req = $json;\nconst ans = $json;\n// mergeByPosition places first and second item fields together in one json\nconst question = String(req.query || '').trim();\nconst answerText = String(req.answer || '').trim();\nconst chunks = [];\nfor (let i = 0; i < answerText.length; i += 1800) chunks.push(answerText.slice(i, i + 1800));\nreturn [{ json: {\n  notion_qa_db_id: '343eaf7ffa7480808c17e398f070dfe4',\n  session_id: String(req.session_id || ''),\n  chat_id: Number(req.chat_id || 0),\n  question,\n  answer_short: answerText.slice(0, 500),\n  answer_chunks: chunks,\n  route: String(req.route || ''),\n  paper_id: String(req.paper_id || '')\n}}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1240,
+        320
+      ],
+      "id": "c4a2e0e4-8f0c-4d57-a6c8-3a0f6f12f034",
+      "name": "Prepare QA Notion Payload"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.notion.com/v1/pages",
+        "sendHeaders": true,
+        "specifyHeaders": "keypair",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { parent: { database_id: $json.notion_qa_db_id }, properties: { Name: { title: [{ text: { content: `QA ${new Date().toISOString()}` } }] }, Timestamp: { date: { start: new Date().toISOString() } }, SessionID: { rich_text: [{ text: { content: $json.session_id } }] }, ChatID: { number: $json.chat_id }, Question: { rich_text: [{ text: { content: $json.question } }] }, AnswerShort: { rich_text: [{ text: { content: $json.answer_short } }] }, Route: { rich_text: [{ text: { content: $json.route } }] }, PaperID: { rich_text: [{ text: { content: $json.paper_id } }] } }, children: ($json.answer_chunks || []).map(c => ({ object: \"block\", type: \"paragraph\", paragraph: { rich_text: [{ type: \"text\", text: { content: c } }] } })) } }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "headerParametersUi": {
+          "parameter": [
+            {
+              "name": "Notion-Version",
+              "value": "2022-06-28"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1490,
+        320
+      ],
+      "id": "c4a2e0e4-8f0c-4d57-a6c8-3a0f6f12f035",
+      "name": "Notion Insert QA Log",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_ME_NOTION_HEADER_AUTH_CRED_ID",
+          "name": "Notion Header Auth"
         }
       }
     }
@@ -77,7 +447,141 @@
       "main": [
         [
           {
-            "node": "Notify Status",
+            "node": "Notify Daily Status",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Prepare Daily Notion Payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Telegram Trigger": {
+      "main": [
+        [
+          {
+            "node": "Has Text Message?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has Text Message?": {
+      "main": [
+        [
+          {
+            "node": "Is Quit Command?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Notify Follow-up Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Quit Command?": {
+      "main": [
+        [
+          {
+            "node": "Call Reset API (quit)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prepare QA Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Noon Reset Trigger": {
+      "main": [
+        [
+          {
+            "node": "Call Reset API (noon)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Call Reset API (noon)": {
+      "main": [
+        [
+          {
+            "node": "Notify Noon Reset",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Daily Notion Payload": {
+      "main": [
+        [
+          {
+            "node": "Notion Upsert Daily Summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare QA Request": {
+      "main": [
+        [
+          {
+            "node": "Call Answer API",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Merge QA Request+Answer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Call Answer API": {
+      "main": [
+        [
+          {
+            "node": "Merge QA Request+Answer",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Merge QA Request+Answer": {
+      "main": [
+        [
+          {
+            "node": "Prepare QA Notion Payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare QA Notion Payload": {
+      "main": [
+        [
+          {
+            "node": "Notion Insert QA Log",
             "type": "main",
             "index": 0
           }
